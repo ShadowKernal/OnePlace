@@ -40,10 +40,15 @@ The unpacked executable is also produced under:
 
 ## Install For End Users
 
+End users do not need this repo, Node.js, Rust, or the `src-tauri/...` folder.
+
+They only need the installer `.exe`.
+
 Ship the generated NSIS installer to users. They can install it by:
 
 1. Downloading `OnePlace_<version>_x64-setup.exe`
-2. Running the installer
+2. Saving it anywhere on their PC, such as `Downloads`
+3. Double-clicking the installer
 3. Launching `OnePlace` from the Start menu
 
 The installer is configured for per-user installation, so it should not require admin access in the normal case.
@@ -55,6 +60,14 @@ Send this installer file to Windows users:
 - `src-tauri/target/release/bundle/nsis/OnePlace_0.1.0_x64-setup.exe`
 
 Do not send the unpacked `oneplace.exe` from `src-tauri/target/release/`. The correct file to distribute is the `-setup.exe` installer.
+
+Recommended distribution options:
+
+- Upload the installer to a GitHub Release
+- Send the installer file directly
+- Upload it to Google Drive, Dropbox, or another file host
+
+If someone downloads `OnePlace_0.1.0_x64-setup.exe`, they can run it directly on Windows.
 
 ## Notes
 
