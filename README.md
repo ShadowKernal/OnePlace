@@ -48,6 +48,14 @@ Ship the generated NSIS installer to users. They can install it by:
 
 The installer is configured for per-user installation, so it should not require admin access in the normal case.
 
+## What To Send People
+
+Send this installer file to Windows users:
+
+- `src-tauri/target/release/bundle/nsis/OnePlace_0.1.0_x64-setup.exe`
+
+Do not send the unpacked `oneplace.exe` from `src-tauri/target/release/`. The correct file to distribute is the `-setup.exe` installer.
+
 ## Notes
 
 - Tauri bundling is enabled in `src-tauri/tauri.conf.json`.
