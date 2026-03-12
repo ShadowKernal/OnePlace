@@ -44,6 +44,10 @@ End users do not need this repo, Node.js, Rust, or the `src-tauri/...` folder.
 
 They only need the installer `.exe`.
 
+Users should download the installer from the GitHub Releases page for this repo:
+
+- `https://github.com/ShadowKernal/OnePlace/releases`
+
 Ship the generated NSIS installer to users. They can install it by:
 
 1. Downloading `OnePlace_<version>_x64-setup.exe`
@@ -68,6 +72,10 @@ Recommended distribution options:
 - Upload it to Google Drive, Dropbox, or another file host
 
 If someone downloads `OnePlace_0.1.0_x64-setup.exe`, they can run it directly on Windows.
+
+Recommended public download location:
+
+- `https://github.com/ShadowKernal/OnePlace/releases`
 
 ## Notes
 
