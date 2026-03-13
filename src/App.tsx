@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -7,6 +8,7 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { createPortal } from 'react-dom'
@@ -118,6 +120,8 @@ type Notebook = {
 }
 
 type SearchScope = 'section' | 'notebook' | 'all'
+type SearchFilter = 'all' | 'content' | 'tag' | 'task' | 'title'
+type ReviewScope = 'page' | SearchScope
 
 type PageSortMode = 'manual' | 'updated-desc' | 'updated-asc' | 'title-asc' | 'title-desc' | 'created-desc'
 
@@ -172,12 +176,35 @@ type SearchResult = {
   groupId: string
   groupName: string
   isSubpage: boolean
+  matchedFields?: SearchFilter[]
+  matchSnippet?: string
   notebookId: string
   notebookName: string
   page: Page
+  score?: number
   sectionId: string
   sectionName: string
 }
+
+type TaskStatusFilter = 'all' | 'done' | 'open'
+
+type TaskResult = SearchResult & {
+  isOverdue: boolean
+}
+
+type TagResult = SearchResult & {
+  matchedTag: string
+}
+
+type CopilotMessage = {
+  id: string
+  prompt: string
+  response: string
+}
+
+type PageWidthMode = 'normal' | 'wide'
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 type VisiblePage = {
   depth: number
@@ -212,6 +239,18 @@ type DragPosition = {
 type RecentNotebookEntry = {
   name: string
   path: string
+}
+
+type NavigationEntry = {
+  groupId: string
+  notebookId: string
+  pageId: string
+  sectionId: string
+}
+
+type AudioInputDevice = {
+  deviceId: string
+  label: string
 }
 
 const ribbonTabs = ['File', 'Home', 'Insert', 'Draw', 'History', 'Review', 'View']
@@ -322,6 +361,29 @@ const searchScopeLabels: Record<SearchScope, string> = {
   section: 'Current section',
 }
 
+const searchFilterLabels: Record<SearchFilter, string> = {
+  all: 'All',
+  content: 'Content',
+  tag: 'Tags',
+  task: 'Tasks',
+  title: 'Titles',
+}
+
+const reviewScopeLabels: Record<ReviewScope, string> = {
+  all: 'All notebooks',
+  notebook: 'Current notebook',
+  page: 'Current page',
+  section: 'Current section',
+}
+
+const taskStatusLabels: Record<TaskStatusFilter, string> = {
+  all: 'All tasks',
+  done: 'Completed',
+  open: 'Open',
+}
+
+const builtInTags = ['Important', 'Question', 'Follow Up', 'Idea', 'Decision', 'Customer', 'Blocked', 'Urgent']
+
 const formatDate = (value: string) =>
   new Intl.DateTimeFormat('en-CA', {
     day: 'numeric',
@@ -341,6 +403,13 @@ const formatPageTime = (value: string) =>
   new Intl.DateTimeFormat('en-CA', {
     hour: 'numeric',
     minute: '2-digit',
+  }).format(new Date(value))
+
+const formatDueDate = (value: string) =>
+  new Intl.DateTimeFormat('en-CA', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
   }).format(new Date(value))
 
 const createId = () => crypto.randomUUID()
@@ -398,6 +467,24 @@ const extractSnippetText = (content: string) => {
 const buildSnippet = (title: string, content: string, timestamp = new Date().toISOString()) => {
   const plain = extractSnippetText(content)
   return `${formatPageDate(timestamp)}\n${plain || title}`.slice(0, 120)
+}
+
+const buildSearchSnippet = (text: string, needle: string) => {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  if (!compact) return 'No text preview available.'
+  const index = compact.toLowerCase().indexOf(needle)
+  if (index === -1) return compact.slice(0, 140)
+  const start = Math.max(0, index - 36)
+  const end = Math.min(compact.length, index + needle.length + 72)
+  const prefix = start > 0 ? '...' : ''
+  const suffix = end < compact.length ? '...' : ''
+  return `${prefix}${compact.slice(start, end)}${suffix}`
+}
+
+const formatElapsedTime = (totalSeconds: number) => {
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
 const escapeHtml = (value: string) =>
@@ -627,6 +714,33 @@ const sanitizePastedHtml = (value: string) => {
   return doc.body.innerHTML
 }
 
+const countTextMatchesInHtml = (value: string, needle: string) => {
+  if (!needle.trim()) return 0
+  const doc = new DOMParser().parseFromString(`<body>${value}</body>`, 'text/html')
+  const text = doc.body.textContent ?? ''
+  const matches = text.match(new RegExp(escapeRegExp(needle), 'gi'))
+  return matches?.length ?? 0
+}
+
+const replaceTextInHtml = (value: string, needle: string, replacement: string) => {
+  if (!needle.trim()) return value
+  const doc = new DOMParser().parseFromString(`<body>${value}</body>`, 'text/html')
+  const pattern = new RegExp(escapeRegExp(needle), 'gi')
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT)
+  const nodes: Text[] = []
+
+  while (walker.nextNode()) {
+    const node = walker.currentNode
+    if (node instanceof Text) nodes.push(node)
+  }
+
+  nodes.forEach((node) => {
+    node.textContent = (node.textContent ?? '').replace(pattern, replacement)
+  })
+
+  return doc.body.innerHTML
+}
+
 const normalizeTerminalText = (value: string) =>
   value
     .normalize('NFKD')
@@ -709,6 +823,7 @@ const recordPageVersion = (
   pageId: string,
   title: string,
   content: string,
+  versionId?: string,
 ) => {
   const existing = versions[pageId] ?? []
   const latest = existing[0]
@@ -721,7 +836,7 @@ const recordPageVersion = (
     [pageId]: [
       {
         content,
-        id: createId(),
+        id: versionId ?? createId(),
         savedAt: new Date().toISOString(),
         title,
       },
@@ -1334,6 +1449,12 @@ function App() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const [isDirty, setIsDirty] = useState(false)
   const [isRecordingAudio, setIsRecordingAudio] = useState(false)
+  const [isAudioPaneOpen, setIsAudioPaneOpen] = useState(false)
+  const [isAudioPaused, setIsAudioPaused] = useState(false)
+  const [audioDevices, setAudioDevices] = useState<AudioInputDevice[]>([])
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState('default')
+  const [audioRecordingSeconds, setAudioRecordingSeconds] = useState(0)
+  const [isDictating, setIsDictating] = useState(false)
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [unlockedSectionIds, setUnlockedSectionIds] = useState<string[]>([])
   const [saveLabel, setSaveLabel] = useState('Loading notes...')
@@ -1342,6 +1463,38 @@ function App() {
   const [isFontMenuOpen, setIsFontMenuOpen] = useState(false)
   const [isFontSizeMenuOpen, setIsFontSizeMenuOpen] = useState(false)
   const [isCopilotOpen, setIsCopilotOpen] = useState(false)
+  const [isTaskPaneOpen, setIsTaskPaneOpen] = useState(false)
+  const [isTagPaneOpen, setIsTagPaneOpen] = useState(false)
+  const [searchFilter, setSearchFilter] = useState<SearchFilter>('all')
+  const [taskPaneScope, setTaskPaneScope] = useState<SearchScope>('all')
+  const [taskStatusFilter, setTaskStatusFilter] = useState<TaskStatusFilter>('open')
+  const [tagPaneScope, setTagPaneScope] = useState<SearchScope>('all')
+  const [selectedTagFilter, setSelectedTagFilter] = useState('')
+  const [customTagDraft, setCustomTagDraft] = useState('')
+  const [copilotDraft, setCopilotDraft] = useState('')
+  const [copilotMessages, setCopilotMessages] = useState<CopilotMessage[]>([])
+  const [isReviewPaneOpen, setIsReviewPaneOpen] = useState(false)
+  const [reviewFind, setReviewFind] = useState('')
+  const [reviewReplace, setReviewReplace] = useState('')
+  const [reviewScope, setReviewScope] = useState<ReviewScope>('page')
+  const [isHistoryPaneOpen, setIsHistoryPaneOpen] = useState(false)
+  const [isMeetingDetailsOpen, setIsMeetingDetailsOpen] = useState(false)
+  const [isTemplatePaneOpen, setIsTemplatePaneOpen] = useState(false)
+  const [selectedHistoryVersionId, setSelectedHistoryVersionId] = useState('')
+  const [selectedTemplateId, setSelectedTemplateId] = useState(pageTemplates[0]?.id ?? '')
+  const [navigationHistory, setNavigationHistory] = useState<NavigationEntry[]>([])
+  const [navigationIndex, setNavigationIndex] = useState(-1)
+  const [meetingTitleDraft, setMeetingTitleDraft] = useState('')
+  const [meetingDateDraft, setMeetingDateDraft] = useState(new Date().toISOString().slice(0, 10))
+  const [meetingTimeDraft, setMeetingTimeDraft] = useState(new Date().toTimeString().slice(0, 5))
+  const [meetingLocationDraft, setMeetingLocationDraft] = useState('')
+  const [meetingAttendeesDraft, setMeetingAttendeesDraft] = useState('')
+  const [meetingAgendaDraft, setMeetingAgendaDraft] = useState('')
+  const [editorZoom, setEditorZoom] = useState(1)
+  const [showRuleLines, setShowRuleLines] = useState(false)
+  const [pageWidthMode, setPageWidthMode] = useState<PageWidthMode>('normal')
+  const [isNotebookPaneVisible, setIsNotebookPaneVisible] = useState(true)
+  const [isPagesPaneVisible, setIsPagesPaneVisible] = useState(true)
   const [selectedFontFamily, setSelectedFontFamily] = useState('Calibri')
   const [selectedFontSize, setSelectedFontSize] = useState('11')
   const [dragState, setDragState] = useState<DragState | null>(null)
@@ -1357,9 +1510,12 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const drawSurfaceRef = useRef<SVGSVGElement | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const dictationRecognitionRef = useRef<BrowserSpeechRecognition | null>(null)
   const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null)
   const speechTranscriptRef = useRef('')
   const recordingChunksRef = useRef<Blob[]>([])
+  const audioTimerRef = useRef<number | null>(null)
   const inkDrawingRef = useRef<InkStroke | null>(null)
   const styleMenuRef = useRef<HTMLDivElement | null>(null)
   const fontMenuRef = useRef<HTMLDivElement | null>(null)
@@ -1371,6 +1527,7 @@ function App() {
   const saveTimer = useRef<number | null>(null)
   const suppressClickAfterDragRef = useRef(false)
   const selectionRangeRef = useRef<Range | null>(null)
+  const isApplyingNavigationRef = useRef(false)
   const lastSavedPayloadRef = useRef('')
   const trackedRecentPageRef = useRef('')
   const shortcutActionsRef = useRef({
@@ -1593,6 +1750,50 @@ function App() {
   }, [appState.selectedPageId, isLoaded])
 
   useEffect(() => {
+    if (!isLoaded || !appState.selectedNotebookId || !appState.selectedSectionGroupId || !appState.selectedSectionId || !appState.selectedPageId) {
+      return
+    }
+
+    const nextEntry: NavigationEntry = {
+      groupId: appState.selectedSectionGroupId,
+      notebookId: appState.selectedNotebookId,
+      pageId: appState.selectedPageId,
+      sectionId: appState.selectedSectionId,
+    }
+
+    if (isApplyingNavigationRef.current) {
+      isApplyingNavigationRef.current = false
+      return
+    }
+
+    setNavigationHistory((current) => {
+      const active = current[navigationIndex]
+      if (
+        active &&
+        active.notebookId === nextEntry.notebookId &&
+        active.groupId === nextEntry.groupId &&
+        active.sectionId === nextEntry.sectionId &&
+        active.pageId === nextEntry.pageId
+      ) {
+        return current
+      }
+
+      const trimmed = current.slice(0, navigationIndex + 1)
+      const nextHistory = [...trimmed, nextEntry].slice(-40)
+      const nextIndex = nextHistory.length - 1
+      window.setTimeout(() => setNavigationIndex(nextIndex), 0)
+      return nextHistory
+    })
+  }, [
+    appState.selectedNotebookId,
+    appState.selectedPageId,
+    appState.selectedSectionGroupId,
+    appState.selectedSectionId,
+    isLoaded,
+    navigationIndex,
+  ])
+
+  useEffect(() => {
     const pageTitle = page?.title?.trim() || 'Untitled Page'
     const notebookTitle = notebook?.name?.trim() || 'Notebook'
     const nextTitle = `${isDirty ? '* ' : ''}${pageTitle} - ${notebookTitle} - OneNote`
@@ -1729,16 +1930,82 @@ function App() {
     }
   }, [dragState])
 
-  const matchesSearch = (
+  const getSearchMatch = (
     targetPage: Page,
     notebookName: string,
     groupName: string,
     sectionName: string,
     needle: string,
-  ) =>
-    `${targetPage.title} ${targetPage.snippet} ${targetPage.content.replace(/<[^>]+>/g, ' ')} ${targetPage.tags.join(' ')} ${targetPage.task?.status ?? ''} ${targetPage.task?.dueAt ?? ''} ${notebookName} ${groupName} ${sectionName}`
-      .toLowerCase()
-      .includes(needle)
+    filter: SearchFilter,
+  ) => {
+    const titleText = targetPage.title.trim()
+    const contentText = `${targetPage.snippet} ${extractSnippetText(targetPage.content)}`
+      .replace(/\s+/g, ' ')
+      .trim()
+    const tagText = targetPage.tags.join(' ').trim()
+    const taskText = [targetPage.task?.status ?? '', targetPage.task?.dueAt ?? ''].join(' ').trim()
+    const locationText = `${notebookName} ${groupName} ${sectionName}`.trim()
+
+    const fields: Array<{ field: SearchFilter; text: string; score: number }> = [
+      { field: 'title', score: 5, text: titleText },
+      { field: 'content', score: 3, text: `${contentText} ${locationText}`.trim() },
+      { field: 'tag', score: 4, text: tagText },
+      { field: 'task', score: 4, text: taskText },
+    ]
+
+    const allowedFields = filter === 'all' ? fields : fields.filter((entry) => entry.field === filter)
+    const matchedFields = allowedFields
+      .filter((entry) => entry.text.toLowerCase().includes(needle))
+      .map((entry) => entry.field)
+
+    if (matchedFields.length === 0) return null
+
+    const score = allowedFields
+      .filter((entry) => matchedFields.includes(entry.field))
+      .reduce((total, entry) => total + entry.score, 0)
+
+    const snippetSource = matchedFields.includes('title')
+      ? titleText
+      : matchedFields.includes('tag')
+        ? tagText
+        : matchedFields.includes('task')
+          ? taskText
+          : contentText
+
+    return {
+      matchedFields,
+      matchSnippet: buildSearchSnippet(snippetSource || contentText || titleText, needle),
+      score,
+    }
+  }
+
+  const renderHighlightedText = (text: string, needle: string) => {
+    if (!needle) return text
+    const lowerText = text.toLowerCase()
+    const lowerNeedle = needle.toLowerCase()
+    const parts: ReactNode[] = []
+    let cursor = 0
+    let index = lowerText.indexOf(lowerNeedle)
+
+    while (index !== -1) {
+      if (index > cursor) {
+        parts.push(<span key={`${cursor}-text`}>{text.slice(cursor, index)}</span>)
+      }
+      parts.push(
+        <mark key={`${index}-mark`} className="search-highlight">
+          {text.slice(index, index + needle.length)}
+        </mark>,
+      )
+      cursor = index + needle.length
+      index = lowerText.indexOf(lowerNeedle, cursor)
+    }
+
+    if (cursor < text.length) {
+      parts.push(<span key={`${cursor}-tail`}>{text.slice(cursor)}</span>)
+    }
+
+    return parts.length > 0 ? parts : text
+  }
 
   const visiblePages = useMemo(() => {
     if (!section || isCurrentSectionLocked) return []
@@ -1748,9 +2015,9 @@ function App() {
     if (!needle || searchScope !== 'section') return flattened
 
     return flattened.filter(({ page: item }) =>
-      matchesSearch(item, notebook?.name ?? '', sectionGroup?.name ?? '', section.name, needle),
+      Boolean(getSearchMatch(item, notebook?.name ?? '', sectionGroup?.name ?? '', section.name, needle, searchFilter)),
     )
-  }, [isCurrentSectionLocked, notebook?.name, pageSortMode, query, searchScope, section, sectionGroup?.name])
+  }, [isCurrentSectionLocked, notebook?.name, pageSortMode, query, searchFilter, searchScope, section, sectionGroup?.name])
 
   const searchResults = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -1773,13 +2040,177 @@ function App() {
             return []
           }
 
-          return flattenPages(sortPagesTree(part.pages, pageSortMode), 0, true)
-            .filter((item) => matchesSearch(item.page, entry.name, group.name, part.name, needle))
-            .map(
-              (item): SearchResult => ({
+          return flattenPages(sortPagesTree(part.pages, pageSortMode), 0, true).flatMap((item) => {
+            const match = getSearchMatch(item.page, entry.name, group.name, part.name, needle, searchFilter)
+            if (!match) return []
+            return [
+              {
                 groupId: group.id,
                 groupName: group.name,
                 isSubpage: item.depth > 0,
+                matchedFields: match.matchedFields,
+                matchSnippet: match.matchSnippet,
+                notebookId: entry.id,
+                notebookName: entry.name,
+                page: item.page,
+                score: match.score,
+                sectionId: part.id,
+                sectionName: part.name,
+              } satisfies SearchResult,
+            ]
+          })
+        }),
+      ),
+    )
+
+    return results.sort(
+      (left, right) =>
+        right.score - left.score ||
+        new Date(right.page.updatedAt).getTime() - new Date(left.page.updatedAt).getTime(),
+    )
+  }, [appState.notebooks, notebook, pageSortMode, query, searchFilter, searchScope, section, sectionGroup])
+
+  const taskResults = useMemo(() => {
+    const notebookTargets =
+      taskPaneScope === 'section'
+        ? notebook && sectionGroup && section
+          ? [notebook]
+          : []
+        : taskPaneScope === 'notebook' && notebook
+          ? [notebook]
+          : appState.notebooks
+
+    const now = Date.now()
+    const results = notebookTargets.flatMap((entry) =>
+      entry.sectionGroups.flatMap((group) =>
+        group.sections.flatMap((part) => {
+          if (
+            taskPaneScope === 'section' &&
+            (entry.id !== notebook?.id || group.id !== sectionGroup?.id || part.id !== section?.id)
+          ) {
+            return []
+          }
+
+          return flattenPages(sortPagesTree(part.pages, pageSortMode), 0, true)
+            .filter((item) => item.page.task)
+            .filter((item) => taskStatusFilter === 'all' || item.page.task?.status === taskStatusFilter)
+            .map(
+              (item): TaskResult => ({
+                groupId: group.id,
+                groupName: group.name,
+                isOverdue:
+                  Boolean(item.page.task?.dueAt) &&
+                  item.page.task?.status === 'open' &&
+                  new Date(item.page.task?.dueAt ?? '').getTime() < now,
+                isSubpage: item.depth > 0,
+                notebookId: entry.id,
+                notebookName: entry.name,
+                page: item.page,
+                sectionId: part.id,
+                sectionName: part.name,
+              }),
+            )
+        }),
+      ),
+    )
+
+    return results.sort((left, right) => {
+      const leftDue = left.page.task?.dueAt ? new Date(left.page.task.dueAt).getTime() : Number.MAX_SAFE_INTEGER
+      const rightDue = right.page.task?.dueAt ? new Date(right.page.task.dueAt).getTime() : Number.MAX_SAFE_INTEGER
+      if (leftDue !== rightDue) return leftDue - rightDue
+      return new Date(right.page.updatedAt).getTime() - new Date(left.page.updatedAt).getTime()
+    })
+  }, [appState.notebooks, notebook, pageSortMode, section, sectionGroup, taskPaneScope, taskStatusFilter])
+
+  const taskSummary = useMemo(
+    () =>
+      appState.notebooks
+        .flatMap((entry) =>
+          entry.sectionGroups.flatMap((group) =>
+            group.sections.flatMap((part) => flattenPages(part.pages, 0, true).map((item) => item.page.task)),
+          ),
+        )
+        .filter((task): task is PageTask => Boolean(task))
+        .reduce(
+          (summary, task) => ({
+            all: summary.all + 1,
+            done: summary.done + (task.status === 'done' ? 1 : 0),
+            open: summary.open + (task.status === 'open' ? 1 : 0),
+          }),
+          { all: 0, done: 0, open: 0 },
+        ),
+    [appState.notebooks],
+  )
+
+  const tagCatalog = useMemo(() => {
+    const notebookTargets =
+      tagPaneScope === 'section'
+        ? notebook && sectionGroup && section
+          ? [notebook]
+          : []
+        : tagPaneScope === 'notebook' && notebook
+          ? [notebook]
+          : appState.notebooks
+
+    const counts = new Map<string, number>()
+    notebookTargets.forEach((entry) =>
+      entry.sectionGroups.forEach((group) =>
+        group.sections.forEach((part) => {
+          if (
+            tagPaneScope === 'section' &&
+            (entry.id !== notebook?.id || group.id !== sectionGroup?.id || part.id !== section?.id)
+          ) {
+            return
+          }
+
+          flattenPages(part.pages, 0, true).forEach((item) => {
+            item.page.tags.forEach((tag) => {
+              counts.set(tag, (counts.get(tag) ?? 0) + 1)
+            })
+          })
+        }),
+      ),
+    )
+
+    return [...new Set([...builtInTags, ...counts.keys()])]
+      .map((tag) => ({ count: counts.get(tag) ?? 0, tag }))
+      .sort((left, right) => {
+        if (right.count !== left.count) return right.count - left.count
+        return left.tag.localeCompare(right.tag)
+      })
+  }, [appState.notebooks, notebook, section, sectionGroup, tagPaneScope])
+
+  const tagResults = useMemo(() => {
+    if (!selectedTagFilter) return []
+
+    const notebookTargets =
+      tagPaneScope === 'section'
+        ? notebook && sectionGroup && section
+          ? [notebook]
+          : []
+        : tagPaneScope === 'notebook' && notebook
+          ? [notebook]
+          : appState.notebooks
+
+    const normalizedFilter = selectedTagFilter.toLocaleLowerCase()
+    const results = notebookTargets.flatMap((entry) =>
+      entry.sectionGroups.flatMap((group) =>
+        group.sections.flatMap((part) => {
+          if (
+            tagPaneScope === 'section' &&
+            (entry.id !== notebook?.id || group.id !== sectionGroup?.id || part.id !== section?.id)
+          ) {
+            return []
+          }
+
+          return flattenPages(sortPagesTree(part.pages, pageSortMode), 0, true)
+            .filter((item) => item.page.tags.some((tag) => tag.toLocaleLowerCase() === normalizedFilter))
+            .map(
+              (item): TagResult => ({
+                groupId: group.id,
+                groupName: group.name,
+                isSubpage: item.depth > 0,
+                matchedTag: selectedTagFilter,
                 notebookId: entry.id,
                 notebookName: entry.name,
                 page: item.page,
@@ -1794,7 +2225,7 @@ function App() {
     return results.sort(
       (left, right) => new Date(right.page.updatedAt).getTime() - new Date(left.page.updatedAt).getTime(),
     )
-  }, [appState.notebooks, notebook, pageSortMode, query, searchScope, section, sectionGroup])
+  }, [appState.notebooks, notebook, pageSortMode, section, sectionGroup, selectedTagFilter, tagPaneScope])
 
   const recentPages = useMemo(
     () =>
@@ -1827,6 +2258,39 @@ function App() {
         ),
     [appState.meta.recentPageIds, appState.notebooks],
   )
+  const canGoBack = navigationIndex > 0
+  const canGoForward = navigationIndex >= 0 && navigationIndex < navigationHistory.length - 1
+
+  const navigateToEntry = (entry: NavigationEntry, suppressHistory = false) => {
+    if (suppressHistory) {
+      isApplyingNavigationRef.current = true
+    }
+    setAppState((current) => ({
+      ...current,
+      selectedNotebookId: entry.notebookId,
+      selectedPageId: entry.pageId,
+      selectedSectionGroupId: entry.groupId,
+      selectedSectionId: entry.sectionId,
+    }))
+  }
+
+  const goBack = () => {
+    if (!canGoBack) return
+    const nextIndex = navigationIndex - 1
+    const entry = navigationHistory[nextIndex]
+    if (!entry) return
+    setNavigationIndex(nextIndex)
+    navigateToEntry(entry, true)
+  }
+
+  const goForward = () => {
+    if (!canGoForward) return
+    const nextIndex = navigationIndex + 1
+    const entry = navigationHistory[nextIndex]
+    if (!entry) return
+    setNavigationIndex(nextIndex)
+    navigateToEntry(entry, true)
+  }
 
   const selectedPageLocation = useMemo(
     () => (section && page ? findPageLocation(section.pages, page.id) : undefined),
@@ -1915,14 +2379,23 @@ function App() {
   }
 
   const openSearchResult = (result: SearchResult) => {
-    setAppState((current) => ({
-      ...current,
-      selectedNotebookId: result.notebookId,
-      selectedSectionGroupId: result.groupId,
-      selectedSectionId: result.sectionId,
-      selectedPageId: result.page.id,
-    }))
+    navigateToEntry({
+      groupId: result.groupId,
+      notebookId: result.notebookId,
+      pageId: result.page.id,
+      sectionId: result.sectionId,
+    })
     setQuery('')
+  }
+
+  const openTaskResult = (result: TaskResult) => {
+    openSearchResult(result)
+    setActiveTab('Review')
+  }
+
+  const openTagResult = (result: TagResult) => {
+    openSearchResult(result)
+    setActiveTab('Review')
   }
 
   const setPageSortMode = (nextMode: PageSortMode) => {
@@ -1956,13 +2429,12 @@ function App() {
 
     if (!match) return
 
-    setAppState((current) => ({
-      ...current,
-      selectedNotebookId: match.notebookId,
-      selectedSectionGroupId: match.groupId,
-      selectedSectionId: match.sectionId,
-      selectedPageId: match.pageId,
-    }))
+    navigateToEntry({
+      groupId: match.groupId,
+      notebookId: match.notebookId,
+      pageId: match.pageId,
+      sectionId: match.sectionId,
+    })
   }
 
   const lockSection = (sectionId: string) => {
@@ -2052,17 +2524,119 @@ function App() {
     setSaveLabel('Section protection removed')
   }
 
+  const updatePageById = (pageId: string, updater: (targetPage: Page) => Page) => {
+    setAppState((current) => ({
+      ...current,
+      notebooks: current.notebooks.map((item) => ({
+        ...item,
+        sectionGroups: item.sectionGroups.map((group) => ({
+          ...group,
+          sections: group.sections.map((entry) => ({
+            ...entry,
+            pages: updateNestedPages(entry.pages, pageId, updater),
+          })),
+        })),
+      })),
+    }))
+  }
+
   const addTagToCurrentPage = () => {
-    if (!page) return
-    const tag = window.prompt('Add a tag', '')?.trim()
-    if (!tag) return
-    const nextTags = [...new Set([...page.tags, tag])]
-    updatePage({ tags: nextTags })
+    setIsTagPaneOpen((current) => {
+      const next = !current
+      if (next && !selectedTagFilter && builtInTags.length > 0) {
+        setSelectedTagFilter(builtInTags[0])
+      }
+      return next
+    })
+  }
+
+  const toggleTagOnPage = (pageId: string, tag: string) => {
+    const normalizedTag = tag.trim()
+    if (!normalizedTag) return
+
+    updatePageById(pageId, (note) => {
+      const hasTag = note.tags.some((entry) => entry.toLocaleLowerCase() === normalizedTag.toLocaleLowerCase())
+      const nextTags = hasTag
+        ? note.tags.filter((entry) => entry.toLocaleLowerCase() !== normalizedTag.toLocaleLowerCase())
+        : [...note.tags, normalizedTag]
+
+      return {
+        ...note,
+        snippet: buildSnippet(note.title, note.content),
+        tags: nextTags,
+        updatedAt: new Date().toISOString(),
+      }
+    })
+  }
+
+  const addSelectedTagToCurrentPage = () => {
+    if (!page || !selectedTagFilter) return
+    toggleTagOnPage(page.id, selectedTagFilter)
+  }
+
+  const addCustomTagToCurrentPage = () => {
+    const value = customTagDraft.trim()
+    if (!page || !value) return
+    toggleTagOnPage(page.id, value)
+    setSelectedTagFilter(value)
+    setCustomTagDraft('')
   }
 
   const toggleCurrentTask = () => {
     if (!page) return
     updatePage({ task: page.task ? null : defaultTask() })
+  }
+
+  const toggleTaskForPage = (pageId: string) => {
+    const target = appState.notebooks
+      .flatMap((entry) => entry.sectionGroups.flatMap((group) => group.sections.flatMap((part) => flattenPages(part.pages, 0, true))))
+      .find((item) => item.page.id === pageId)?.page
+    if (!target?.task) return
+
+    updatePageById(pageId, (note) => ({
+      ...note,
+      snippet: buildSnippet(note.title, note.content),
+      task: {
+        ...note.task!,
+        status: note.task?.status === 'done' ? 'open' : 'done',
+      },
+      updatedAt: new Date().toISOString(),
+    }))
+  }
+
+  const setTaskDueDateForPage = (pageId: string) => {
+    const target = appState.notebooks
+      .flatMap((entry) => entry.sectionGroups.flatMap((group) => group.sections.flatMap((part) => flattenPages(part.pages, 0, true))))
+      .find((item) => item.page.id === pageId)?.page
+    if (!target) return
+
+    const currentDue = target.task?.dueAt?.slice(0, 10) ?? ''
+    const value = window.prompt('Due date (YYYY-MM-DD), leave blank to clear', currentDue)?.trim()
+    if (value === undefined) return
+
+    updatePageById(pageId, (note) => ({
+      ...note,
+      snippet: buildSnippet(note.title, note.content),
+      task: note.task
+        ? {
+            ...note.task,
+            dueAt: value ? new Date(value).toISOString() : null,
+          }
+        : {
+            ...defaultTask(),
+            dueAt: value ? new Date(value).toISOString() : null,
+          },
+      updatedAt: new Date().toISOString(),
+    }))
+  }
+
+  const clearTaskForPage = (pageId: string) => {
+    updatePageById(pageId, (note) => ({
+      ...note,
+      snippet: buildSnippet(note.title, note.content),
+      task: null,
+      updatedAt: new Date().toISOString(),
+    }))
   }
 
   const toggleCurrentTaskComplete = () => {
@@ -2077,20 +2651,7 @@ function App() {
 
   const setCurrentTaskDueDate = () => {
     if (!page) return
-    const currentDue = page.task?.dueAt?.slice(0, 10) ?? ''
-    const value = window.prompt('Due date (YYYY-MM-DD), leave blank to clear', currentDue)?.trim()
-    if (value === undefined) return
-    updatePage({
-      task: page.task
-        ? {
-            ...page.task,
-            dueAt: value ? new Date(value).toISOString() : null,
-          }
-        : {
-            ...defaultTask(),
-            dueAt: value ? new Date(value).toISOString() : null,
-          },
-    })
+    setTaskDueDateForPage(page.id)
   }
 
   const renamePage = (pageId: string) => {
@@ -2126,6 +2687,7 @@ function App() {
 
   const saveCurrentPageVersion = (targetPage = page) => {
     if (!targetPage) return
+    const nextVersionId = createId()
     setAppState((current) => ({
       ...current,
       meta: {
@@ -2135,10 +2697,24 @@ function App() {
           targetPage.id,
           targetPage.title,
           targetPage.content,
+          nextVersionId,
         ),
       },
     }))
+    setSelectedHistoryVersionId(nextVersionId)
+    setIsHistoryPaneOpen(true)
     setSaveLabel(`Saved version for ${targetPage.title}`)
+  }
+
+  const restorePageVersion = (version: PageVersion) => {
+    updatePage({
+      content: version.content,
+      title: version.title,
+    })
+    if (editorRef.current) {
+      editorRef.current.innerHTML = hydratePageContent(version.content, appState.meta.assets)
+    }
+    setSaveLabel(`Restored ${formatDate(version.savedAt)}`)
   }
 
   const restoreSavedPageVersion = () => {
@@ -2157,11 +2733,16 @@ function App() {
     const version = versions[Number(picked) - 1]
     if (!version) return
 
-    updatePage({
-      content: version.content,
-      title: version.title,
-    })
-    setSaveLabel(`Restored ${formatDate(version.savedAt)}`)
+    restorePageVersion(version)
+  }
+
+  const restoreSelectedHistoryVersion = () => {
+    if (!selectedHistoryVersion) {
+      window.alert('No saved versions for this page yet.')
+      return
+    }
+
+    restorePageVersion(selectedHistoryVersion)
   }
 
   const openContextMenu = (
@@ -2663,12 +3244,61 @@ function App() {
   }
 
   const applyPageTemplate = () => {
-    const options = pageTemplates.map((template, index) => `${index + 1}. ${template.label}`).join('\n')
-    const picked = window.prompt(`Choose a template\n\n${options}`, '1')?.trim()
-    if (!picked) return
-    const template = pageTemplates[Number(picked) - 1]
+    setSelectedTemplateId((current) => current || pageTemplates[0]?.id || '')
+    setIsTemplatePaneOpen(true)
+  }
+
+  const insertSelectedTemplate = () => {
+    const template = pageTemplates.find((entry) => entry.id === selectedTemplateId) ?? pageTemplates[0]
     if (!template) return
     insertHtmlAtSelection(template.html)
+    setIsTemplatePaneOpen(false)
+    setSaveLabel(`Inserted ${template.label}`)
+  }
+
+  const openMeetingDetailsPane = () => {
+    setMeetingTitleDraft(page?.title?.trim() && page.title !== 'Untitled Page' ? page.title : 'Team Sync')
+    setMeetingDateDraft(new Date().toISOString().slice(0, 10))
+    setMeetingTimeDraft(new Date().toTimeString().slice(0, 5))
+    setMeetingLocationDraft('')
+    setMeetingAttendeesDraft('')
+    setMeetingAgendaDraft('Wins\nRisks\nNext steps')
+    setIsMeetingDetailsOpen(true)
+  }
+
+  const insertMeetingDetails = () => {
+    const attendees = meetingAttendeesDraft
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+    const agendaItems = meetingAgendaDraft
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean)
+
+    const attendeeMarkup =
+      attendees.length > 0 ? attendees.map((value) => `<li>${escapeHtml(value)}</li>`).join('') : '<li></li>'
+    const agendaMarkup =
+      agendaItems.length > 0 ? agendaItems.map((value) => `<li>${escapeHtml(value)}</li>`).join('') : '<li></li>'
+
+    insertHtmlAtSelection(`
+      <section class="template-block meeting-details-block">
+        <h2>${escapeHtml(meetingTitleDraft.trim() || 'Meeting Details')}</h2>
+        <p><strong>Date:</strong> ${escapeHtml(meetingDateDraft || new Date().toLocaleDateString())}</p>
+        <p><strong>Time:</strong> ${escapeHtml(meetingTimeDraft || 'TBD')}</p>
+        <p><strong>Location:</strong> ${escapeHtml(meetingLocationDraft.trim() || 'TBD')}</p>
+        <h3>Attendees</h3>
+        <ul>${attendeeMarkup}</ul>
+        <h3>Agenda</h3>
+        <ul>${agendaMarkup}</ul>
+        <h3>Notes</h3>
+        <p></p>
+        <h3>Action Items</h3>
+        <ul class="checklist"><li><label><input type="checkbox" /> Follow up</label></li></ul>
+      </section>
+    `)
+    setIsMeetingDetailsOpen(false)
+    setSaveLabel(`Inserted meeting details for ${meetingTitleDraft.trim() || 'meeting'}`)
   }
 
   const saveNow = async () => {
@@ -2778,7 +3408,317 @@ function App() {
     })
   }
 
-  const insertAudioNote = async (blob: Blob) => {
+  const buildCopilotResponse = (prompt: string) => {
+    const noteText = extractSnippetText(hydratePageContent(page?.content ?? '', appState.meta.assets))
+      .replace(/\s+/g, ' ')
+      .trim()
+    const sentences = noteText
+      .split(/(?<=[.!?])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter(Boolean)
+    const bullets = noteText
+      .split(/\n|(?<=\.)\s+/)
+      .map((item) => item.replace(/^[-*\u2022]\s*/, '').trim())
+      .filter((item) => item.length > 2)
+      .slice(0, 6)
+    const baseSummary = sentences.slice(0, 3)
+    const normalizedPrompt = prompt.toLocaleLowerCase()
+
+    if (normalizedPrompt.includes('organize')) {
+      return `
+<section class="template-block">
+  <h3>Organized Notes</h3>
+  <p><strong>Overview:</strong> ${escapeHtml(baseSummary[0] ?? 'Capture the main objective for this page.')}</p>
+  <h4>Key Points</h4>
+  <ul>${(bullets.length > 0 ? bullets : ['Summarize the important decisions.', 'List the outstanding questions.', 'Capture follow-up work.'])
+    .slice(0, 4)
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join('')}</ul>
+  <h4>Next Steps</h4>
+  <ul class="checklist">
+    ${(bullets.slice(0, 2).length > 0 ? bullets.slice(0, 2) : ['Review the note and assign owners.', 'Confirm deadlines and dependencies.'])
+      .map((item) => `<li><label><input type="checkbox" /> ${escapeHtml(item)}</label></li>`)
+      .join('')}
+  </ul>
+</section>`.trim()
+    }
+
+    if (normalizedPrompt.includes('bulleted list')) {
+      return `
+<section class="template-block">
+  <h3>Paragraph Rewrite</h3>
+  ${(bullets.length > 0 ? bullets : ['This page would benefit from a more narrative summary.', 'Turn the main ideas into complete thoughts for easier sharing.'])
+    .slice(0, 4)
+    .map((item) => `<p>${escapeHtml(item.charAt(0).toUpperCase() + item.slice(1))}.</p>`)
+    .join('')}
+</section>`.trim()
+    }
+
+    if (normalizedPrompt.includes('offsite')) {
+      return `
+<section class="template-block">
+  <h3>Team Offsite Plan</h3>
+  <p><strong>Goal:</strong> Align the team, make decisions, and leave with owned follow-ups.</p>
+  <h4>Day Structure</h4>
+  <ul>
+    <li>Arrival dinner and context setting.</li>
+    <li>Morning strategy workshop and product review.</li>
+    <li>Afternoon planning, risk review, and team-building block.</li>
+  </ul>
+  <h4>Preparation</h4>
+  <ul class="checklist">
+    <li><label><input type="checkbox" /> Confirm attendees and travel windows.</label></li>
+    <li><label><input type="checkbox" /> Draft agenda owners and discussion goals.</label></li>
+    <li><label><input type="checkbox" /> Capture decisions and actions in this page.</label></li>
+  </ul>
+</section>`.trim()
+    }
+
+    if (normalizedPrompt.includes('productivity') || normalizedPrompt.includes('manage my time')) {
+      return `
+<section class="template-block">
+  <h3>Productivity Ideas</h3>
+  <ul>
+    <li>Group similar work into focused blocks and protect them on the calendar.</li>
+    <li>Turn open questions into explicit next actions with owners and due dates.</li>
+    <li>Use tags to separate urgent work from important but non-urgent work.</li>
+    <li>End meetings with a short written summary and assigned follow-ups.</li>
+  </ul>
+</section>`.trim()
+    }
+
+    return `
+<section class="template-block">
+  <h3>Copilot Draft</h3>
+  <p><strong>Prompt:</strong> ${escapeHtml(prompt)}</p>
+  <p>${escapeHtml(baseSummary[0] ?? 'Start by summarizing the current page in one sentence.')}</p>
+  <ul>${(bullets.length > 0 ? bullets : ['Capture the main point.', 'Call out the risks.', 'Write the next action.'])
+    .slice(0, 3)
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join('')}</ul>
+</section>`.trim()
+  }
+
+  const runCopilotPrompt = (prompt: string) => {
+    if (!page) return
+    const response = buildCopilotResponse(prompt)
+    insertHtmlAtSelection(response)
+    setCopilotMessages((current) => [{ id: createId(), prompt, response }, ...current].slice(0, 6))
+    setSaveLabel('Copilot inserted content into the page')
+  }
+
+  const submitCopilotDraft = () => {
+    const prompt = copilotDraft.trim()
+    if (!prompt) return
+    runCopilotPrompt(prompt)
+    setCopilotDraft('')
+  }
+
+  const adjustEditorZoom = (delta: number) => {
+    setEditorZoom((current) => Math.min(1.6, Math.max(0.7, Math.round((current + delta) * 100) / 100)))
+  }
+
+  const reviewScopePages = useMemo(() => {
+    if (reviewScope === 'page') {
+      return page ? [page] : []
+    }
+
+    const notebookTargets =
+      reviewScope === 'section'
+        ? notebook && sectionGroup && section
+          ? [notebook]
+          : []
+        : reviewScope === 'notebook' && notebook
+          ? [notebook]
+          : appState.notebooks
+
+    return notebookTargets.flatMap((entry) =>
+      entry.sectionGroups.flatMap((group) =>
+        group.sections.flatMap((part) => {
+          if (
+            reviewScope === 'section' &&
+            (entry.id !== notebook?.id || group.id !== sectionGroup?.id || part.id !== section?.id)
+          ) {
+            return []
+          }
+
+          return flattenPages(part.pages, 0, true).map((item) => item.page)
+        }),
+      ),
+    )
+  }, [appState.notebooks, notebook, page, reviewScope, section, sectionGroup])
+
+  const reviewMatchCount = useMemo(
+    () =>
+      reviewScopePages.reduce(
+        (total, targetPage) => total + countTextMatchesInHtml(targetPage.content ?? '', reviewFind),
+        0,
+      ),
+    [reviewFind, reviewScopePages],
+  )
+  const currentPageVersions = useMemo(() => (page ? appState.meta.pageVersions[page.id] ?? [] : []), [appState.meta.pageVersions, page])
+  const selectedHistoryVersion = useMemo(
+    () => currentPageVersions.find((version) => version.id === selectedHistoryVersionId) ?? currentPageVersions[0] ?? null,
+    [currentPageVersions, selectedHistoryVersionId],
+  )
+  const selectedTemplate = useMemo(
+    () => pageTemplates.find((entry) => entry.id === selectedTemplateId) ?? pageTemplates[0] ?? null,
+    [selectedTemplateId],
+  )
+  const historyPreviewText = selectedHistoryVersion ? extractSnippetText(selectedHistoryVersion.content).slice(0, 180) : ''
+
+  useEffect(() => {
+    if (!page) {
+      setSelectedHistoryVersionId('')
+      return
+    }
+
+    const latestVersionId = currentPageVersions[0]?.id ?? ''
+    setSelectedHistoryVersionId((current) =>
+      current && currentPageVersions.some((version) => version.id === current) ? current : latestVersionId,
+    )
+  }, [currentPageVersions, page])
+
+  useEffect(
+    () => () => {
+      clearAudioRecordingTimer()
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+    },
+    [],
+  )
+
+  const replaceInReviewScope = () => {
+    if (!reviewFind.trim() || reviewScopePages.length === 0) return
+
+    const targetIds = new Set(reviewScopePages.map((targetPage) => targetPage.id))
+    let replacements = 0
+
+    setAppState((current) => ({
+      ...current,
+      notebooks: current.notebooks.map((entry) => ({
+        ...entry,
+        sectionGroups: entry.sectionGroups.map((group) => ({
+          ...group,
+          sections: group.sections.map((part) => ({
+            ...part,
+            pages: part.pages.map(function transformPageTree(note): Page {
+              const nextChildren = note.children.map(transformPageTree)
+              if (!targetIds.has(note.id)) {
+                return nextChildren === note.children ? note : { ...note, children: nextChildren }
+              }
+              const nextContent = replaceTextInHtml(note.content, reviewFind, reviewReplace)
+              replacements += countTextMatchesInHtml(note.content, reviewFind)
+              if (nextContent === note.content && nextChildren === note.children) return note
+              return {
+                ...note,
+                children: nextChildren,
+                content: nextContent,
+                snippet: buildSnippet(note.title, nextContent),
+                updatedAt: new Date().toISOString(),
+              }
+            }),
+          })),
+        })),
+      })),
+    }))
+
+    if (page && targetIds.has(page.id) && editorRef.current) {
+      const nextCurrentContent = replaceTextInHtml(page.content, reviewFind, reviewReplace)
+      editorRef.current.innerHTML = hydratePageContent(nextCurrentContent, appState.meta.assets)
+    }
+
+    setSaveLabel(
+      replacements > 0
+        ? `Replaced ${reviewFind} across ${reviewScopeLabels[reviewScope].toLowerCase()}`
+        : `No matches to replace in ${reviewScopeLabels[reviewScope].toLowerCase()}`,
+    )
+  }
+
+  const getSpeechRecognitionApi = () => window.SpeechRecognition ?? window.webkitSpeechRecognition
+
+  const stopDictation = () => {
+    dictationRecognitionRef.current?.stop()
+  }
+
+  const startDictation = () => {
+    if (isDictating) {
+      stopDictation()
+      return
+    }
+
+    const SpeechRecognitionApi = getSpeechRecognitionApi()
+    if (!SpeechRecognitionApi) {
+      setSaveLabel('Dictation is not available here')
+      return
+    }
+
+    if (isTranscribing) {
+      stopSpeechTranscription()
+    }
+
+    try {
+      const recognition = new SpeechRecognitionApi()
+      dictationRecognitionRef.current = recognition
+      recognition.continuous = true
+      recognition.interimResults = false
+      recognition.lang = 'en-US'
+      recognition.onresult = (event) => {
+        const dictatedText = Array.from(
+          { length: event.results.length - event.resultIndex },
+          (_, index) => event.results[event.resultIndex + index],
+        )
+          .filter((result) => result.isFinal)
+          .map((result) => result[0]?.transcript ?? '')
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+
+        if (!dictatedText) return
+        insertTextAsHtml(`${dictatedText} `)
+        setSaveLabel(`Dictated: ${dictatedText.slice(0, 48)}${dictatedText.length > 48 ? '...' : ''}`)
+      }
+      recognition.onerror = (event) => {
+        dictationRecognitionRef.current = null
+        setIsDictating(false)
+        setSaveLabel(event.error === 'not-allowed' ? 'Microphone permission denied' : 'Dictation stopped')
+      }
+      recognition.onend = () => {
+        dictationRecognitionRef.current = null
+        setIsDictating(false)
+        setSaveLabel('Dictation stopped')
+      }
+      recognition.start()
+      setIsDictating(true)
+      setSaveLabel('Listening for dictation...')
+    } catch {
+      dictationRecognitionRef.current = null
+      setIsDictating(false)
+      setSaveLabel('Dictation is not available here')
+    }
+  }
+
+  const loadAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return
+    const devices = await navigator.mediaDevices.enumerateDevices()
+    const inputs = devices
+      .filter((device) => device.kind === 'audioinput')
+      .map((device, index) => ({
+        deviceId: device.deviceId || `audio-${index}`,
+        label: device.label || `Microphone ${index + 1}`,
+      }))
+
+    setAudioDevices(inputs)
+    if (inputs.length > 0 && !inputs.some((device) => device.deviceId === selectedAudioDeviceId)) {
+      setSelectedAudioDeviceId(inputs[0].deviceId)
+    }
+  }, [selectedAudioDeviceId])
+
+  useEffect(() => {
+    if (!isAudioPaneOpen) return
+    void loadAudioDevices()
+  }, [isAudioPaneOpen, loadAudioDevices])
+
+  const insertAudioNote = async (blob: Blob, durationSeconds: number, deviceLabel: string) => {
     const assetId = createId()
     const extension = blob.type.split('/')[1] || 'webm'
     const file = new File([blob], `audio-note-${new Date().toISOString().slice(0, 10)}.${extension}`, {
@@ -2799,9 +3739,22 @@ function App() {
     insertHtmlAtSelection(`
       <figure class="audio-note" contenteditable="false">
         <audio controls data-asset-id="${assetId}" src="${dataUrl}"></audio>
+        <div class="audio-note-meta">${escapeHtml(formatElapsedTime(durationSeconds))} · ${escapeHtml(deviceLabel)}</div>
         <figcaption>${escapeHtml(file.name)}</figcaption>
       </figure>
     `)
+  }
+
+  const clearAudioRecordingTimer = () => {
+    if (audioTimerRef.current) {
+      window.clearInterval(audioTimerRef.current)
+      audioTimerRef.current = null
+    }
+  }
+
+  const openAudioPane = () => {
+    void loadAudioDevices()
+    setIsAudioPaneOpen(true)
   }
 
   const startAudioRecording = async () => {
@@ -2812,7 +3765,11 @@ function App() {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedAudioDeviceId && selectedAudioDeviceId !== 'default' ? { deviceId: { exact: selectedAudioDeviceId } } : true,
+      })
+      mediaStreamRef.current = stream
+      await loadAudioDevices()
       const mimeType = MediaRecorder.isTypeSupported('audio/webm')
         ? 'audio/webm'
         : MediaRecorder.isTypeSupported('audio/mp4')
@@ -2820,6 +3777,8 @@ function App() {
           : ''
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
       recordingChunksRef.current = []
+      setAudioRecordingSeconds(0)
+      setIsAudioPaused(false)
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           recordingChunksRef.current.push(event.data)
@@ -2829,24 +3788,55 @@ function App() {
         const blob = new Blob(recordingChunksRef.current, {
           type: recorder.mimeType || 'audio/webm',
         })
-        stream.getTracks().forEach((track) => track.stop())
+        clearAudioRecordingTimer()
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+        mediaStreamRef.current = null
         mediaRecorderRef.current = null
         recordingChunksRef.current = []
         setIsRecordingAudio(false)
+        setIsAudioPaused(false)
         if (blob.size > 0) {
-          await insertAudioNote(blob)
+          const deviceLabel =
+            audioDevices.find((device) => device.deviceId === selectedAudioDeviceId)?.label ?? 'Microphone'
+          await insertAudioNote(blob, audioRecordingSeconds, deviceLabel)
         }
       }
       mediaRecorderRef.current = recorder
       recorder.start()
+      audioTimerRef.current = window.setInterval(() => {
+        setAudioRecordingSeconds((current) => current + 1)
+      }, 1000)
       setIsRecordingAudio(true)
+      setIsAudioPaneOpen(true)
       setSaveLabel('Recording audio...')
     } catch {
       setSaveLabel('Microphone permission denied')
     }
   }
 
+  const toggleAudioPause = () => {
+    const recorder = mediaRecorderRef.current
+    if (!recorder) return
+    if (recorder.state === 'recording') {
+      recorder.pause()
+      clearAudioRecordingTimer()
+      setIsAudioPaused(true)
+      setSaveLabel('Audio recording paused')
+      return
+    }
+
+    if (recorder.state === 'paused') {
+      recorder.resume()
+      audioTimerRef.current = window.setInterval(() => {
+        setAudioRecordingSeconds((current) => current + 1)
+      }, 1000)
+      setIsAudioPaused(false)
+      setSaveLabel('Recording audio...')
+    }
+  }
+
   const stopAudioRecording = () => {
+    clearAudioRecordingTimer()
     mediaRecorderRef.current?.stop()
   }
 
@@ -2860,10 +3850,14 @@ function App() {
       return
     }
 
-    const SpeechRecognitionApi = window.SpeechRecognition ?? window.webkitSpeechRecognition
+    const SpeechRecognitionApi = getSpeechRecognitionApi()
     if (!SpeechRecognitionApi) {
       setSaveLabel('Speech transcription is not available here')
       return
+    }
+
+    if (isDictating) {
+      stopDictation()
     }
 
     try {
@@ -3976,9 +4970,9 @@ function App() {
               <ShowIcon size={26} />
               <span>Printout</span>
             </button>
-            <button onClick={() => void (isRecordingAudio ? stopAudioRecording() : startAudioRecording())} type="button">
+            <button onClick={openAudioPane} type="button">
               <SaveIcon size={26} />
-              <span>{isRecordingAudio ? 'Stop Audio' : 'Audio Note'}</span>
+              <span>{isRecordingAudio ? 'Audio Controls' : 'Audio Note'}</span>
             </button>
             <button onClick={openAttachmentPicker} type="button">
               <AttachmentIcon size={26} />
@@ -4047,6 +5041,10 @@ function App() {
               <ShowIcon size={26} />
               <span>Restore Version</span>
             </button>
+            <button onClick={() => setIsHistoryPaneOpen((current) => !current)} type="button">
+              <ListLinesIcon size={26} />
+              <span>{isHistoryPaneOpen ? 'Hide History' : 'History Pane'}</span>
+            </button>
             <button onClick={() => setQuery('')} type="button">
               <SearchIcon size={26} />
               <span>Clear Search</span>
@@ -4063,7 +5061,7 @@ function App() {
           <div className="ribbon-cluster styles">
             <button onClick={addTagToCurrentPage} type="button">
               <TagsIcon size={26} />
-              <span>Add Tag</span>
+              <span>{isTagPaneOpen ? 'Hide Tags' : 'Tags'}</span>
             </button>
             <button onClick={toggleCurrentTask} type="button">
               <BulletsIcon size={26} />
@@ -4077,6 +5075,14 @@ function App() {
               <ShowIcon size={26} />
               <span>{page?.task?.status === 'done' ? 'Mark Open' : 'Mark Done'}</span>
             </button>
+            <button onClick={() => setIsReviewPaneOpen((current) => !current)} type="button">
+              <SearchIcon size={26} />
+              <span>{isReviewPaneOpen ? 'Hide Find' : 'Find Replace'}</span>
+            </button>
+            <button onClick={() => setIsTaskPaneOpen((current) => !current)} type="button">
+              <FormatMotivationIcon size={26} />
+              <span>{isTaskPaneOpen ? 'Hide Task Pane' : 'Task Pane'}</span>
+            </button>
             <span className="ribbon-label">Review</span>
           </div>
         </section>
@@ -4087,13 +5093,37 @@ function App() {
       return (
         <section className="ribbon">
           <div className="ribbon-cluster styles">
+            <button onClick={() => adjustEditorZoom(0.1)} type="button">
+              <TextSizeUpIcon size={26} />
+              <span>Zoom In</span>
+            </button>
+            <button onClick={() => adjustEditorZoom(-0.1)} type="button">
+              <TextSizeDownIcon size={26} />
+              <span>Zoom Out</span>
+            </button>
+            <button onClick={() => setEditorZoom(1)} type="button">
+              <ShowIcon size={26} />
+              <span>{Math.round(editorZoom * 100)}%</span>
+            </button>
+            <button onClick={() => setPageWidthMode((current) => (current === 'normal' ? 'wide' : 'normal'))} type="button">
+              <TableIcon size={26} />
+              <span>{pageWidthMode === 'normal' ? 'Wide Page' : 'Normal Page'}</span>
+            </button>
+            <button onClick={() => setShowRuleLines((current) => !current)} type="button">
+              <BulletsIcon size={26} />
+              <span>{showRuleLines ? 'Hide Rule Lines' : 'Rule Lines'}</span>
+            </button>
+            <button onClick={() => setIsNotebookPaneVisible((current) => !current)} type="button">
+              <NotebookStackIcon size={26} />
+              <span>{isNotebookPaneVisible ? 'Hide Notebooks' : 'Show Notebooks'}</span>
+            </button>
+            <button onClick={() => setIsPagesPaneVisible((current) => !current)} type="button">
+              <ListLinesIcon size={26} />
+              <span>{isPagesPaneVisible ? 'Hide Pages' : 'Show Pages'}</span>
+            </button>
             <button onClick={() => editorRef.current?.scrollIntoView({ behavior: 'smooth' })} type="button">
               <ShowIcon size={26} />
               <span>Focus Page</span>
-            </button>
-            <button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })} type="button">
-              <ListLinesIcon size={26} />
-              <span>Top</span>
             </button>
             <button onClick={() => void saveNow()} type="button">
               <SaveIcon size={26} />
@@ -4317,7 +5347,7 @@ function App() {
             <TagsIcon size={22} />
             <span>To Do Tag</span>
           </button>
-          <button className="home-vertical-action" onClick={() => insertTemplate('<p><strong>Tagged:</strong> </p>')} type="button">
+          <button className="home-vertical-action" onClick={() => setIsTaskPaneOpen(true)} type="button">
             <FormatMotivationIcon size={22} />
             <span>Find Outlook Tasks</span>
           </button>
@@ -4325,17 +5355,17 @@ function App() {
             <ProjectIcon size={22} />
             <span>Email Page</span>
           </button>
-          <button className="home-vertical-action" onClick={applyPageTemplate} type="button">
+          <button className="home-vertical-action" onClick={openMeetingDetailsPane} type="button">
             <TableIcon size={22} />
             <span>Meeting Details</span>
           </button>
           <button
             className="home-vertical-action"
-            onClick={() => void (isRecordingAudio ? stopAudioRecording() : startAudioRecording())}
+            onClick={startDictation}
             type="button"
           >
             <SaveIcon size={22} />
-            <span>Dictate</span>
+            <span>{isDictating ? 'Stop Dictate' : 'Dictate'}</span>
           </button>
           <button className="home-vertical-action" onClick={startSpeechTranscription} type="button">
             <ShowIcon size={22} />
@@ -4363,6 +5393,15 @@ function App() {
   const windowTitle = `${page?.title?.trim() || 'Untitled Page'} - ${notebook?.name ?? 'Notebook'} - OneNote`
   const saveStatusText = isDirty ? `${saveLabel} · Unsaved changes` : saveLabel
   const displayVersion = appInfo?.version ?? __APP_VERSION__
+  const hasSidePane =
+    isCopilotOpen ||
+    isTaskPaneOpen ||
+    isTagPaneOpen ||
+    isReviewPaneOpen ||
+    isHistoryPaneOpen ||
+    isMeetingDetailsOpen ||
+    isAudioPaneOpen ||
+    isTemplatePaneOpen
   const suggestedPrompts = [
     'Change this bulleted list into full sentences and paragraphs',
     'Draft a plan for a team offsite in Santa Fe',
@@ -4388,6 +5427,12 @@ function App() {
               >
                 <UndoIcon size={16} />
               </button>
+              <button className="quick-action icon-only" disabled={!canGoBack} onClick={goBack} type="button">
+                ‹
+              </button>
+              <button className="quick-action icon-only" disabled={!canGoForward} onClick={goForward} type="button">
+                ›
+              </button>
               <button className="quick-action icon-only small" type="button">
                 <ChevronDownIcon size={12} />
               </button>
@@ -4412,24 +5457,83 @@ function App() {
               type="search"
               value={query}
             />
-            {searchResults.length > 0 ? (
+            {query.trim() ? (
               createPortal(
                 <div
                   className="search-results search-results-floating"
                   ref={searchResultsPanelRef}
                   style={getFloatingPanelStyle(titlebarSearchRef.current)}
                 >
-                  {searchResults.slice(0, 8).map((result) => (
+                  <div className="search-results-toolbar">
                     <button
-                      key={result.page.id}
-                      className="search-result"
-                      onClick={() => openSearchResult(result)}
+                      className="search-scope-chip"
+                      onClick={() =>
+                        setAppState((current) => ({
+                          ...current,
+                          meta: {
+                            ...current.meta,
+                            searchScope:
+                              current.meta.searchScope === 'all'
+                                ? 'notebook'
+                                : current.meta.searchScope === 'notebook'
+                                  ? 'section'
+                                  : 'all',
+                          },
+                        }))
+                      }
                       type="button"
                     >
-                      <strong>{result.isSubpage ? `${result.page.title} (Subpage)` : result.page.title}</strong>
-                      <span>{result.notebookName} / {result.groupName} / {result.sectionName}</span>
+                      {searchScopeLabels[searchScope]}
                     </button>
-                  ))}
+                    <div className="search-filter-row">
+                      {(['all', 'title', 'content', 'tag', 'task'] as SearchFilter[]).map((filter) => (
+                        <button
+                          key={filter}
+                          className={`search-filter-chip ${searchFilter === filter ? 'active' : ''}`}
+                          onClick={() => setSearchFilter(filter)}
+                          type="button"
+                        >
+                          {searchFilterLabels[filter]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="search-results-summary">
+                    <strong>{searchResults.length}</strong>
+                    <span>
+                      result{searchResults.length === 1 ? '' : 's'} in {searchScopeLabels[searchScope].toLowerCase()}
+                    </span>
+                  </div>
+                  <div className="search-results-list">
+                    {searchResults.length > 0 ? (
+                      searchResults.slice(0, 8).map((result) => (
+                        <button
+                          key={result.page.id}
+                          className="search-result"
+                          onClick={() => openSearchResult(result)}
+                          type="button"
+                        >
+                          <strong>
+                            {renderHighlightedText(
+                              result.isSubpage ? `${result.page.title} (Subpage)` : result.page.title,
+                              query.trim(),
+                            )}
+                          </strong>
+                          <span>{result.notebookName} / {result.groupName} / {result.sectionName}</span>
+                          <p>{renderHighlightedText(result.matchSnippet ?? result.page.snippet, query.trim())}</p>
+                          <div className="search-result-meta">
+                            {(result.matchedFields ?? ['content']).map((field) => (
+                              <em key={`${result.page.id}-${field}`}>{searchFilterLabels[field]}</em>
+                            ))}
+                          </div>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="search-results-empty">
+                        No matches for this query with the current search scope and filter.
+                      </div>
+                    )}
+                  </div>
                 </div>,
                 document.body,
               )
@@ -4466,8 +5570,10 @@ function App() {
 
         {renderRibbon()}
 
-        <main className="workspace">
-          <aside className="notebooks-pane">
+        <main
+          className={`workspace ${isNotebookPaneVisible ? '' : 'notebooks-hidden'} ${isPagesPaneVisible ? '' : 'pages-hidden'}`}
+        >
+          <aside className="notebooks-pane" hidden={!isNotebookPaneVisible}>
             <div className="pane-heading">
               <span className="heading-icon">
                 <NotebookStackIcon size={18} />
@@ -4483,8 +5589,11 @@ function App() {
               <span className="pane-count">{appState.notebooks.length}</span>
             </div>
             <div className="notebook-tree">
-              {appState.notebooks.map((item) => (
-                <div key={item.id} className="notebook-tree-group">
+              {appState.notebooks.map((item) => {
+                const isSelectedNotebook = item.id === notebook?.id
+
+                return (
+                <div key={item.id} className={`notebook-tree-group ${isSelectedNotebook ? 'active' : ''}`}>
                   <div className="notebook-row">
                     <button
                       className={`notebook-item ${item.id === notebook?.id ? 'active' : ''} ${dragState?.type === 'notebook' && dragState.notebookId === item.id ? 'dragging' : ''} ${dropTarget?.type === 'notebook' && dropTarget.notebookId === item.id && dropTarget.position === 'before' ? 'drop-before' : ''} ${dropTarget?.type === 'notebook' && dropTarget.notebookId === item.id && dropTarget.position === 'after' ? 'drop-after' : ''}`}
@@ -4519,47 +5628,103 @@ function App() {
                       <span>{item.name}</span>
                     </button>
                   </div>
+                  {isSelectedNotebook ? (
                   <div className="notebook-sections">
-                    {item.sectionGroups.flatMap((group) =>
-                      group.sections.map((entry) => (
-                        (() => {
-                          const isSectionDropTarget =
-                            dropTarget?.type === 'section' && 'sectionId' in dropTarget && dropTarget.sectionId === entry.id
+                    {item.sectionGroups.map((group) => {
+                      const isGroupInsideDropTarget =
+                        dropTarget?.type === 'section' &&
+                        dropTarget.groupId === group.id &&
+                        dropTarget.position === 'inside'
 
-                          return (
-                        <button
-                          key={entry.id}
-                          className={`notebook-section-link ${item.id === notebook?.id && entry.id === section?.id ? 'active' : ''} ${dragState?.type === 'section' && dragState.sectionId === entry.id ? 'dragging' : ''} ${isSectionDropTarget && dropTarget.position === 'before' ? 'drop-before' : ''} ${isSectionDropTarget && dropTarget.position === 'after' ? 'drop-after' : ''}`}
-                          onClick={() => {
-                            selectNotebook(item.id)
-                            selectSection(group.id, entry.id)
-                          }}
-                          onPointerDown={(event) => {
-                            if (item.id !== notebook?.id) return
-                            beginDrag(event, { type: 'section', groupId: group.id, sectionId: entry.id })
-                          }}
-                          onPointerEnter={allowDrop}
-                          onPointerMove={(event) => {
-                            if (item.id !== notebook?.id) return
-                            setSectionDropTarget(event, group.id, entry.id)
-                          }}
-                          onPointerUp={() => {
-                            if (
-                              item.id === notebook?.id &&
-                              isSectionDropTarget
-                            ) {
-                              moveSection(group.id, entry.id, dropTarget.position)
-                            }
-                          }}
-                          type="button"
+                      return (
+                        <div
+                          key={group.id}
+                          className={`notebook-section-group ${isGroupInsideDropTarget ? 'drop-inside' : ''}`}
                         >
-                          <span className="section-color" style={{ backgroundColor: entry.color }} />
-                          <span>{entry.name}</span>
-                        </button>
-                          )
-                        })()
-                      )),
-                    )}
+                          <div
+                            className="notebook-section-group-label"
+                            onPointerEnter={(event) => {
+                              if (item.id !== notebook?.id) return
+                              allowDrop(event)
+                              setSectionGroupInsideDropTarget(event, group.id)
+                            }}
+                            onPointerMove={(event) => {
+                              if (item.id !== notebook?.id) return
+                              setSectionGroupInsideDropTarget(event, group.id)
+                            }}
+                            onPointerUp={() => {
+                              if (
+                                item.id === notebook?.id &&
+                                dropTarget?.type === 'section' &&
+                                dropTarget.groupId === group.id &&
+                                dropTarget.position === 'inside'
+                              ) {
+                                moveSectionToGroup(group.id)
+                              }
+                            }}
+                          >
+                            {group.name}
+                          </div>
+                          {group.sections.map((entry) => {
+                            const isSectionDropTarget =
+                              dropTarget?.type === 'section' &&
+                              'sectionId' in dropTarget &&
+                              dropTarget.sectionId === entry.id
+
+                            return (
+                              <button
+                                key={entry.id}
+                                className={`notebook-section-link ${item.id === notebook?.id && entry.id === section?.id ? 'active' : ''} ${dragState?.type === 'section' && dragState.sectionId === entry.id ? 'dragging' : ''} ${isSectionDropTarget && dropTarget.position === 'before' ? 'drop-before' : ''} ${isSectionDropTarget && dropTarget.position === 'after' ? 'drop-after' : ''}`}
+                                onClick={() => {
+                                  selectNotebook(item.id)
+                                  selectSection(group.id, entry.id)
+                                }}
+                                onPointerDown={(event) => {
+                                  if (item.id !== notebook?.id) return
+                                  beginDrag(event, { type: 'section', groupId: group.id, sectionId: entry.id })
+                                }}
+                                onPointerEnter={allowDrop}
+                                onPointerMove={(event) => {
+                                  if (item.id !== notebook?.id) return
+                                  setSectionDropTarget(event, group.id, entry.id)
+                                }}
+                                onPointerUp={() => {
+                                  if (item.id === notebook?.id && isSectionDropTarget) {
+                                    moveSection(group.id, entry.id, dropTarget.position)
+                                  }
+                                }}
+                                type="button"
+                              >
+                                <span className="section-color" style={{ backgroundColor: entry.color }} />
+                                <span>{entry.name}</span>
+                              </button>
+                            )
+                          })}
+                          <div
+                            className="notebook-section-group-dropzone"
+                            onPointerEnter={(event) => {
+                              if (item.id !== notebook?.id) return
+                              allowDrop(event)
+                              setSectionGroupInsideDropTarget(event, group.id)
+                            }}
+                            onPointerMove={(event) => {
+                              if (item.id !== notebook?.id) return
+                              setSectionGroupInsideDropTarget(event, group.id)
+                            }}
+                            onPointerUp={() => {
+                              if (
+                                item.id === notebook?.id &&
+                                dropTarget?.type === 'section' &&
+                                dropTarget.groupId === group.id &&
+                                dropTarget.position === 'inside'
+                              ) {
+                                moveSectionToGroup(group.id)
+                              }
+                            }}
+                          />
+                        </div>
+                      )
+                    })}
                     <button
                       className="notebook-new-section"
                       onClick={() => promptCreateSection(item.sectionGroups[0]?.id)}
@@ -4568,8 +5733,10 @@ function App() {
                       + New section
                     </button>
                   </div>
+                  ) : null}
                 </div>
-              ))}
+                )
+              })}
             </div>
             <div className="pane-footer">
               <button
@@ -4583,7 +5750,7 @@ function App() {
             </div>
           </aside>
 
-          <aside className="pages-pane">
+          <aside className="pages-pane" hidden={!isPagesPaneVisible}>
             <div className="pages-header">
               <div className="pages-heading-copy">
                 <span className="pane-kicker">PAGES</span>
@@ -4736,11 +5903,19 @@ function App() {
                     >
                       <span className="page-accent" style={{ backgroundColor: entry.page.accent }} />
                       <div className="page-card-body">
-                        <strong>{entry.depth > 0 ? `- ${entry.page.title}` : entry.page.title}</strong>
+                        <strong>
+                          {query.trim()
+                            ? renderHighlightedText(entry.depth > 0 ? `- ${entry.page.title}` : entry.page.title, query.trim())
+                            : entry.depth > 0
+                              ? `- ${entry.page.title}`
+                              : entry.page.title}
+                        </strong>
                         <span className="page-date">
                           {snippet.first}
                         </span>
-                        <span className="page-snippet">{snippet.second}</span>
+                        <span className="page-snippet">
+                          {query.trim() ? renderHighlightedText(snippet.second, query.trim()) : snippet.second}
+                        </span>
                       </div>
                     </button>
                   </div>
@@ -4775,7 +5950,7 @@ function App() {
             ) : null}
           </aside>
 
-          <section className={`note-pane ${isCopilotOpen ? 'copilot-open' : 'copilot-closed'}`}>
+          <section className={`note-pane ${hasSidePane ? 'side-pane-open' : 'side-pane-closed'}`}>
             <div className="note-document">
               <div className="note-header">
                 <div className="note-header-main">
@@ -4798,21 +5973,39 @@ function App() {
                     {(appInfo?.name ?? 'OnePlace')} v{displayVersion}
                   </span>
                   <button disabled={isCurrentSectionLocked} onClick={addTagToCurrentPage} type="button">
-                    Tag
+                    {isTagPaneOpen ? 'Hide Tags' : 'Tags'}
                   </button>
                   <button disabled={isCurrentSectionLocked} onClick={toggleCurrentTask} type="button">
                     {page?.task ? 'Task On' : 'Task'}
                   </button>
-                  <button
-                    disabled={isCurrentSectionLocked}
-                    onClick={() => void (isRecordingAudio ? stopAudioRecording() : startAudioRecording())}
-                    type="button"
-                  >
-                    {isRecordingAudio ? 'Stop Audio' : 'Audio'}
+                  <button disabled={isCurrentSectionLocked} onClick={openAudioPane} type="button">
+                    {isRecordingAudio ? 'Audio Controls' : 'Audio'}
+                  </button>
+                  <button onClick={() => setIsTaskPaneOpen((current) => !current)} type="button">
+                    {isTaskPaneOpen ? 'Hide Tasks' : 'Tasks'}
                   </button>
                   <button disabled={isCurrentSectionLocked} onClick={() => saveCurrentPageVersion()} type="button">
                     Version
                   </button>
+                </div>
+                <div className="note-meta-strip">
+                  {page?.tags.map((tag) => (
+                    <button
+                      key={tag}
+                      className="note-tag-chip"
+                      disabled={isCurrentSectionLocked}
+                      onClick={() => toggleTagOnPage(page.id, tag)}
+                      type="button"
+                    >
+                      {tag}
+                    </button>
+                  ))}
+                  {page?.task ? (
+                    <button className={`task-pill ${page.task.status === 'done' ? 'done' : ''}`} onClick={toggleCurrentTaskComplete} type="button">
+                      {page.task.status === 'done' ? 'Task Complete' : 'Task Open'}
+                      {page.task.dueAt ? ` · Due ${formatDueDate(page.task.dueAt)}` : ''}
+                    </button>
+                  ) : null}
                 </div>
               </div>
               <div className="note-canvas-shell">
@@ -4857,7 +6050,7 @@ function App() {
                       </div>
                     ) : null}
                     <div
-                      className="editor-canvas"
+                      className={`editor-canvas ${pageWidthMode === 'wide' ? 'wide' : ''} ${showRuleLines ? 'rule-lines' : ''}`}
                       contentEditable
                       onBlur={syncEditorContent}
                       onClick={handleEditorClick}
@@ -4865,6 +6058,7 @@ function App() {
                       onKeyDown={handleEditorKeyDown}
                       onPaste={(event) => void handleEditorPaste(event)}
                       ref={editorRef}
+                      style={{ zoom: editorZoom.toString() }}
                       suppressContentEditableWarning
                     />
                   </>
@@ -4877,38 +6071,456 @@ function App() {
                 </span>
               </div>
             </div>
-            <aside className="copilot-pane" hidden={!isCopilotOpen}>
-              <div className="copilot-pane-toolbar">
-                <span className="copilot-pane-icon">=</span>
-                <span className="copilot-pane-status">o</span>
-                <span className="copilot-pane-spacer" />
-                <button type="button">...</button>
-                <button onClick={() => setIsCopilotOpen(false)} type="button">x</button>
-              </div>
-              <div className="copilot-pane-body">
-                <div className="copilot-orb" />
-                <h3>Try 'Organize my Notes'</h3>
-                <div className="copilot-compose">
-                  <span>Message Copilot</span>
-                  <div className="copilot-compose-actions">
-                    <button type="button">+</button>
-                    <button type="button">..</button>
-                    <button type="button">o</button>
-                    <button type="button">))</button>
-                  </div>
-                </div>
-                <div className="copilot-prompts">
-                  {suggestedPrompts.map((item) => (
-                    <button key={item} className="copilot-prompt-card" type="button">
-                      {item}
+            {hasSidePane ? (
+              <div className="side-pane-stack">
+                <aside className="template-pane" hidden={!isTemplatePaneOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Page Templates</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setIsTemplatePaneOpen(false)} type="button">
+                      x
                     </button>
-                  ))}
-                </div>
-                <button className="copilot-show-more" type="button">
-                  Show more
-                </button>
+                  </div>
+                  <div className="template-pane-body">
+                    <div className="template-pane-list">
+                      {pageTemplates.map((template) => (
+                        <button
+                          key={template.id}
+                          className={`template-pane-card ${selectedTemplate?.id === template.id ? 'active' : ''}`}
+                          onClick={() => setSelectedTemplateId(template.id)}
+                          type="button"
+                        >
+                          <strong>{template.label}</strong>
+                          <span>{extractSnippetText(template.html).slice(0, 110)}</span>
+                        </button>
+                      ))}
+                    </div>
+                    {selectedTemplate ? (
+                      <div className="template-pane-preview">
+                        <strong>{selectedTemplate.label}</strong>
+                        <p>{extractSnippetText(selectedTemplate.html).slice(0, 220)}</p>
+                        <div className="template-pane-actions">
+                          <button disabled={isCurrentSectionLocked} onClick={insertSelectedTemplate} type="button">
+                            Insert Template
+                          </button>
+                          <button onClick={() => setIsTemplatePaneOpen(false)} type="button">
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </aside>
+                <aside className="audio-pane" hidden={!isAudioPaneOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Audio Note</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setIsAudioPaneOpen(false)} type="button">
+                      x
+                    </button>
+                  </div>
+                  <div className="audio-pane-body">
+                    <div className="audio-pane-status">
+                      <strong>{isRecordingAudio ? (isAudioPaused ? 'Paused' : 'Recording') : 'Ready'}</strong>
+                      <span>{formatElapsedTime(audioRecordingSeconds)}</span>
+                    </div>
+                    <label className="review-pane-field">
+                      <span>Input Device</span>
+                      <select
+                        className="audio-pane-select"
+                        disabled={isRecordingAudio}
+                        onChange={(event) => setSelectedAudioDeviceId(event.target.value)}
+                        value={selectedAudioDeviceId}
+                      >
+                        {audioDevices.length === 0 ? (
+                          <option value="default">Default microphone</option>
+                        ) : (
+                          audioDevices.map((device) => (
+                            <option key={device.deviceId} value={device.deviceId}>
+                              {device.label}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                    <div className="audio-pane-actions">
+                      <button
+                        disabled={isCurrentSectionLocked}
+                        onClick={() => void (isRecordingAudio ? stopAudioRecording() : startAudioRecording())}
+                        type="button"
+                      >
+                        {isRecordingAudio ? 'Stop and Insert' : 'Start Recording'}
+                      </button>
+                      <button disabled={!isRecordingAudio} onClick={toggleAudioPause} type="button">
+                        {isAudioPaused ? 'Resume' : 'Pause'}
+                      </button>
+                    </div>
+                    <div className="review-pane-summary">
+                      <strong>{audioDevices.length || 1}</strong>
+                      <span>microphone source{audioDevices.length === 1 ? '' : 's'} available</span>
+                    </div>
+                  </div>
+                </aside>
+                <aside className="meeting-pane" hidden={!isMeetingDetailsOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Meeting Details</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setIsMeetingDetailsOpen(false)} type="button">
+                      x
+                    </button>
+                  </div>
+                  <div className="meeting-pane-body">
+                    <label className="review-pane-field">
+                      <span>Title</span>
+                      <input onChange={(event) => setMeetingTitleDraft(event.target.value)} type="text" value={meetingTitleDraft} />
+                    </label>
+                    <div className="meeting-pane-grid">
+                      <label className="review-pane-field">
+                        <span>Date</span>
+                        <input onChange={(event) => setMeetingDateDraft(event.target.value)} type="date" value={meetingDateDraft} />
+                      </label>
+                      <label className="review-pane-field">
+                        <span>Time</span>
+                        <input onChange={(event) => setMeetingTimeDraft(event.target.value)} type="time" value={meetingTimeDraft} />
+                      </label>
+                    </div>
+                    <label className="review-pane-field">
+                      <span>Location</span>
+                      <input
+                        onChange={(event) => setMeetingLocationDraft(event.target.value)}
+                        placeholder="Room, link, or location"
+                        type="text"
+                        value={meetingLocationDraft}
+                      />
+                    </label>
+                    <label className="review-pane-field">
+                      <span>Attendees</span>
+                      <input
+                        onChange={(event) => setMeetingAttendeesDraft(event.target.value)}
+                        placeholder="Comma-separated names"
+                        type="text"
+                        value={meetingAttendeesDraft}
+                      />
+                    </label>
+                    <label className="review-pane-field">
+                      <span>Agenda</span>
+                      <textarea
+                        className="meeting-pane-textarea"
+                        onChange={(event) => setMeetingAgendaDraft(event.target.value)}
+                        placeholder="One topic per line"
+                        value={meetingAgendaDraft}
+                      />
+                    </label>
+                    <div className="meeting-pane-actions">
+                      <button disabled={isCurrentSectionLocked} onClick={insertMeetingDetails} type="button">
+                        Insert Meeting Block
+                      </button>
+                      <button onClick={() => setIsMeetingDetailsOpen(false)} type="button">
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                </aside>
+                <aside className="history-pane" hidden={!isHistoryPaneOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Page Versions</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setIsHistoryPaneOpen(false)} type="button">
+                      x
+                    </button>
+                  </div>
+                  <div className="history-pane-body">
+                    <div className="history-pane-summary">
+                      <strong>{currentPageVersions.length}</strong>
+                      <span>saved version{currentPageVersions.length === 1 ? '' : 's'} for this page</span>
+                    </div>
+                    {selectedHistoryVersion ? (
+                      <div className="history-pane-preview">
+                        <div className="history-pane-preview-head">
+                          <strong>{selectedHistoryVersion.title}</strong>
+                          <span>{formatDate(selectedHistoryVersion.savedAt)}</span>
+                        </div>
+                        <p>{historyPreviewText || 'This version has no text preview.'}</p>
+                        <div className="history-pane-actions">
+                          <button disabled={isCurrentSectionLocked} onClick={restoreSelectedHistoryVersion} type="button">
+                            Restore Selected
+                          </button>
+                          <button onClick={() => setSelectedHistoryVersionId(currentPageVersions[0]?.id ?? '')} type="button">
+                            Jump to Latest
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="task-pane-empty">No saved versions for this page yet.</div>
+                    )}
+                    <div className="history-pane-list">
+                      {currentPageVersions.map((version, index) => (
+                        <button
+                          key={version.id}
+                          className={`history-pane-entry ${selectedHistoryVersion?.id === version.id ? 'active' : ''}`}
+                          onClick={() => setSelectedHistoryVersionId(version.id)}
+                          type="button"
+                        >
+                          <div className="history-pane-entry-head">
+                            <strong>{index === 0 ? 'Latest version' : `Version ${currentPageVersions.length - index}`}</strong>
+                            <span>{formatDate(version.savedAt)}</span>
+                          </div>
+                          <div className="history-pane-entry-title">{version.title || 'Untitled Page'}</div>
+                          <p>{extractSnippetText(version.content).slice(0, 120) || 'No text preview available.'}</p>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </aside>
+                <aside className="review-pane" hidden={!isReviewPaneOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Find and Replace</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button
+                      onClick={() =>
+                        setReviewScope((current) =>
+                          current === 'page' ? 'section' : current === 'section' ? 'notebook' : current === 'notebook' ? 'all' : 'page',
+                        )
+                      }
+                      type="button"
+                    >
+                      {reviewScopeLabels[reviewScope]}
+                    </button>
+                    <button onClick={() => setIsReviewPaneOpen(false)} type="button">
+                      x
+                    </button>
+                  </div>
+                  <div className="review-pane-body">
+                    <label className="review-pane-field">
+                      <span>Find</span>
+                      <input
+                        onChange={(event) => setReviewFind(event.target.value)}
+                        placeholder="Text to find"
+                        type="text"
+                        value={reviewFind}
+                      />
+                    </label>
+                    <label className="review-pane-field">
+                      <span>Replace With</span>
+                      <input
+                        onChange={(event) => setReviewReplace(event.target.value)}
+                        placeholder="Replacement text"
+                        type="text"
+                        value={reviewReplace}
+                      />
+                    </label>
+                    <div className="review-pane-summary">
+                      <strong>{reviewMatchCount}</strong>
+                      <span>matches in {reviewScopeLabels[reviewScope].toLowerCase()}</span>
+                    </div>
+                    <div className="review-pane-actions">
+                      <button disabled={!reviewFind.trim()} onClick={replaceInReviewScope} type="button">
+                        Replace All
+                      </button>
+                      <button onClick={() => { setReviewFind(''); setReviewReplace('') }} type="button">
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                </aside>
+                <aside className="tag-pane" hidden={!isTagPaneOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Tag Summary</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setTagPaneScope((current) => (current === 'all' ? 'notebook' : current === 'notebook' ? 'section' : 'all'))} type="button">
+                      {searchScopeLabels[tagPaneScope]}
+                    </button>
+                    <button onClick={() => setIsTagPaneOpen(false)} type="button">
+                      x
+                    </button>
+                  </div>
+                  <div className="tag-pane-body">
+                    <div className="tag-pane-actions">
+                      <button disabled={!page || !selectedTagFilter || isCurrentSectionLocked} onClick={addSelectedTagToCurrentPage} type="button">
+                        Apply selected tag
+                      </button>
+                      <div className="tag-pane-custom">
+                        <input
+                          onChange={(event) => setCustomTagDraft(event.target.value)}
+                          placeholder="Custom tag"
+                          type="text"
+                          value={customTagDraft}
+                        />
+                        <button disabled={!page || !customTagDraft.trim() || isCurrentSectionLocked} onClick={addCustomTagToCurrentPage} type="button">
+                          Add
+                        </button>
+                      </div>
+                    </div>
+                    <div className="tag-pane-catalog">
+                      {tagCatalog.map((entry) => (
+                        <button
+                          key={entry.tag}
+                          className={selectedTagFilter === entry.tag ? 'active' : ''}
+                          onClick={() => setSelectedTagFilter(entry.tag)}
+                          type="button"
+                        >
+                          <span>{entry.tag}</span>
+                          <strong>{entry.count}</strong>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="tag-pane-results">
+                      {selectedTagFilter ? (
+                        <>
+                          <div className="tag-pane-results-title">
+                            {selectedTagFilter} · {tagResults.length} match{tagResults.length === 1 ? '' : 'es'}
+                          </div>
+                          {tagResults.length === 0 ? (
+                            <div className="task-pane-empty">
+                              No pages match this tag in {searchScopeLabels[tagPaneScope].toLowerCase()}.
+                            </div>
+                          ) : (
+                            tagResults.map((result) => (
+                              <article key={`${result.page.id}-${result.matchedTag}`} className="task-pane-card">
+                                <div className="task-pane-card-row">
+                                  <button onClick={() => toggleTagOnPage(result.page.id, result.matchedTag)} type="button">
+                                    Remove
+                                  </button>
+                                  <button className="task-pane-link" onClick={() => openTagResult(result)} type="button">
+                                    {result.page.title}
+                                  </button>
+                                </div>
+                                <p>{result.sectionName} · {result.notebookName}</p>
+                                <div className="task-pane-card-meta">
+                                  <span>{formatDate(result.page.updatedAt)}</span>
+                                  <span>{result.page.tags.join(', ')}</span>
+                                </div>
+                              </article>
+                            ))
+                          )}
+                        </>
+                      ) : (
+                        <div className="task-pane-empty">Select a tag to see matching pages.</div>
+                      )}
+                    </div>
+                  </div>
+                </aside>
+                <aside className="task-pane" hidden={!isTaskPaneOpen}>
+                  <div className="task-pane-toolbar">
+                    <strong>Task Finder</strong>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setTaskPaneScope((current) => (current === 'all' ? 'notebook' : current === 'notebook' ? 'section' : 'all'))} type="button">
+                      {searchScopeLabels[taskPaneScope]}
+                    </button>
+                    <button onClick={() => setIsTaskPaneOpen(false)} type="button">
+                      x
+                    </button>
+                  </div>
+                  <div className="task-pane-body">
+                    <div className="task-pane-summary">
+                      <div>
+                        <strong>{taskSummary.open}</strong>
+                        <span>Open</span>
+                      </div>
+                      <div>
+                        <strong>{taskSummary.done}</strong>
+                        <span>Done</span>
+                      </div>
+                      <div>
+                        <strong>{taskSummary.all}</strong>
+                        <span>Total</span>
+                      </div>
+                    </div>
+                    <div className="task-pane-filters">
+                      {(['open', 'all', 'done'] as TaskStatusFilter[]).map((filter) => (
+                        <button
+                          key={filter}
+                          className={taskStatusFilter === filter ? 'active' : ''}
+                          onClick={() => setTaskStatusFilter(filter)}
+                          type="button"
+                        >
+                          {taskStatusLabels[filter]}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="task-pane-list">
+                      {taskResults.length === 0 ? (
+                        <div className="task-pane-empty">
+                          No tasks in {searchScopeLabels[taskPaneScope].toLowerCase()}.
+                        </div>
+                      ) : (
+                        taskResults.map((result) => (
+                          <article key={result.page.id} className={`task-pane-card ${result.isOverdue ? 'overdue' : ''}`}>
+                            <div className="task-pane-card-row">
+                              <button onClick={() => toggleTaskForPage(result.page.id)} type="button">
+                                {result.page.task?.status === 'done' ? 'Reopen' : 'Done'}
+                              </button>
+                              <button className="task-pane-link" onClick={() => openTaskResult(result)} type="button">
+                                {result.page.title}
+                              </button>
+                            </div>
+                            <p>{result.sectionName} · {result.notebookName}</p>
+                            <div className="task-pane-card-meta">
+                              <span>{result.page.task?.dueAt ? `Due ${formatDueDate(result.page.task.dueAt)}` : 'No due date'}</span>
+                              <span>{result.page.task?.status === 'done' ? 'Completed' : result.isOverdue ? 'Overdue' : 'Open'}</span>
+                            </div>
+                            <div className="task-pane-card-actions">
+                              <button onClick={() => setTaskDueDateForPage(result.page.id)} type="button">
+                                Set due date
+                              </button>
+                              <button onClick={() => clearTaskForPage(result.page.id)} type="button">
+                                Remove task
+                              </button>
+                            </div>
+                          </article>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </aside>
+                <aside className="copilot-pane" hidden={!isCopilotOpen}>
+                  <div className="copilot-pane-toolbar">
+                    <span className="copilot-pane-icon">=</span>
+                    <span className="copilot-pane-status">o</span>
+                    <span className="copilot-pane-spacer" />
+                    <button onClick={() => setCopilotMessages([])} type="button">Clear</button>
+                    <button onClick={() => setIsCopilotOpen(false)} type="button">x</button>
+                  </div>
+                  <div className="copilot-pane-body">
+                    <div className="copilot-orb" />
+                    <h3>Try 'Organize my Notes'</h3>
+                    <div className="copilot-compose">
+                      <span>Message Copilot</span>
+                      <textarea
+                        onChange={(event) => setCopilotDraft(event.target.value)}
+                        placeholder="Ask Copilot to organize, rewrite, summarize, or draft."
+                        value={copilotDraft}
+                      />
+                      <div className="copilot-compose-actions">
+                        <button disabled={!copilotDraft.trim()} onClick={submitCopilotDraft} type="button">Insert</button>
+                        <button onClick={() => setCopilotDraft('Organize my notes into sections with next steps')} type="button">Prompt</button>
+                      </div>
+                    </div>
+                    <div className="copilot-prompts">
+                      {suggestedPrompts.map((item) => (
+                        <button key={item} className="copilot-prompt-card" onClick={() => runCopilotPrompt(item)} type="button">
+                          {item}
+                        </button>
+                      ))}
+                    </div>
+                    {copilotMessages.length > 0 ? (
+                      <div className="copilot-results">
+                        {copilotMessages.map((entry) => (
+                          <article key={entry.id} className="copilot-result-card">
+                            <strong>{entry.prompt}</strong>
+                            <p>{extractSnippetText(entry.response).slice(0, 140)}</p>
+                          </article>
+                        ))}
+                      </div>
+                    ) : (
+                      <button className="copilot-show-more" onClick={() => runCopilotPrompt('Organize my notes into sections with next steps')} type="button">
+                        Insert Organizer
+                      </button>
+                    )}
+                  </div>
+                </aside>
               </div>
-            </aside>
+            ) : null}
           </section>
         </main>
       </div>
