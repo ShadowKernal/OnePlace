@@ -3853,8 +3853,24 @@
 }
 
 .note-toolbar-inline {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 10px;
+}
+
+.app-version-badge {
+  background: #f3eef7;
+  border: 1px solid #dad4e1;
+  border-radius: 999px;
+  color: #5f4d74;
+  display: inline-flex;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1;
+  margin-right: 8px;
+  padding: 6px 10px;
 }
 
 .note-toolbar-inline button {

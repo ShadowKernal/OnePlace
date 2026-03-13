@@ -4770,6 +4770,9 @@ function App() {
                   </div>
                 </div>
                 <div className="note-toolbar-inline">
+                  <span className="app-version-badge">
+                    {(appInfo?.name ?? 'OnePlace')} v{displayVersion}
+                  </span>
                   <button disabled={isCurrentSectionLocked} onClick={addTagToCurrentPage} type="button">
                     Tag
                   </button>

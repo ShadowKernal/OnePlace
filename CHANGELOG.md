@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5 - 2026-03-12
+
+- Moved the visible app version into the note header beside the page action buttons.
+- Kept the status-strip version fallback, but no longer rely on the footer for discoverability.
+
 ## 0.1.4 - 2026-03-12
 
 - Always show the app version in the bottom-right status strip.
