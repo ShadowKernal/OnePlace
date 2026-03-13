@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7 - 2026-03-13
+
+- Improved run-tauri-dev.cmd script with better documentation and dynamic path resolution.
+
 ## 0.1.6 - 2026-03-13
 
 - Fixed drag-and-drop for visible sections in the left notebook pane.
